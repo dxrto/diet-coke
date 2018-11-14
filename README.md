@@ -2,22 +2,30 @@
 
 DevOps hate him!! Lose 5 layers with this simple trick!!!
 
+Read the blog post I wrote about this project: [Medium.com](https://medium.com/@eater./diet-coke-14e329f740e3)
+
 ---
 
 ```
 diet-coke - one weird trick DevOps engineers don't want you to know!
 
-    diet-coke [-i <file>] [-s] [-o <file>] [-g <image>] <layer>-[<layer>]
+    diet-coke [-i <file>] [-s] [-o <file>] [-m <comment>] [-g <image>] <layer>-[<layer>]
     diet-coke [-i <file>] -l
 
 Options:
     -i  Input file, when - is given STDIN is used, default: -
     -o  Output file, when - is given STDOUT is used, default: -
+    -m  Comment to put on the new compressed layer, on default a summary of the old layers will be used
     -g  On which image diet coke should work
     -s  Suffer, even in STDOUT is a tty, write to STDOUT
     -l  List layers in given save file
     -h  Show this help
 ```
+
+# Requirements
+
+- Perl5
+- the `JSON::XS` module (`perl-JSON-XS` in Void, `libjson-xs-perl` in Ubuntu (maybe?), worst case `cpan JSON::XS`)
 
 ## Example
 
@@ -97,7 +105,3 @@ docker image save d.xr.to/php-fpm | ./diet-coke -s 1- | docker image load
 ```
 
 Since the image is tagged, your `d.xr.to/php-fpm` image will now be replaced with a compressed version.
-
----
-
-It's 3am right now, I have officially gone insane.
