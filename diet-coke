@@ -3,7 +3,6 @@ use strict;
 use warnings;
 use List::Util qw(any first);
 use Getopt::Std qw(getopts);
-use Data::Dump qw(dd);
 use POSIX qw(strftime mktime);
 use Digest::SHA qw(sha256_hex);
 use JSON::XS;
@@ -21,12 +20,13 @@ sub usage {
     print <<USAGE
 diet-coke - $trick
 
-    diet-coke [-i <file>] [-s] [-o <file>] [-g <image>] <layer>-[<layer>]
+    diet-coke [-i <file>] [-s] [-o <file>] [-m <comment>] [-g <image>] <layer>-[<layer>]
     diet-coke [-i <file>] -l
 
 Options:
     -i  Input file, when - is given STDIN is used, default: -
     -o  Output file, when - is given STDOUT is used, default: -
+    -m  Comment to put on the new compressed layer, on default a summary of the old layers will be used
     -g  On which image diet coke should work
     -s  Suffer, even in STDOUT is a tty, write to STDOUT
     -l  List layers in given save file
@@ -46,15 +46,16 @@ sub MAIN {
     }
 
     my %options = (
-        input  => '-',
-        output => '-',
-        tty    => (-t 1),
-        suffer => 0,
-        image  => 0,
+        input   => '-',
+        output  => '-',
+        tty     => (-t 1),
+        suffer  => 0,
+        image   => 0,
+        comment => 0,
     );
 
     my %opts = ();
-    getopts('i:so:lg:', \%opts);
+    getopts('i:so:lg:m:', \%opts);
 
     if ($opts{s}) {
         $options{suffer} = 1;
@@ -97,10 +98,15 @@ sub MAIN {
         }
 
         my @keys = keys(%{$details{images}});
-        $options{image} = $keys[0];
+
+        $options{image} = ((first { !/^-image-\d+$/ } @keys) or $keys[0]);
     }
     else {
         $options{image} = $opts{g};
+    }
+
+    if ($opts{m}) {
+        $options{comment} = $opts{m};
     }
 
     eprint "INFO: Selected image: $options{image}\n";
@@ -170,9 +176,20 @@ sub MAIN {
         );
     }
 
+    if (!$options{comment}) {
+        my $comment = 'diet coke: ';
+        my @actions = ();
+        for ($start .. $end_index) {
+            push @actions, $layers[$_]->{expl};
+        }
+
+        $comment .= encode_json \@actions;
+        $options{comment} = $comment;
+    }
+
     splice @{$config{manifest}{Layers}}, $start, ($end - $start), ();
     splice @{$config{config}{rootfs}{diff_ids}}, $start, $end_index, ("sha256:$new_layer_id");
-    splice @{$config{config}{history}}, $start, $end_index, { created => get_time(), comment => "diet coke: $options{image}" };
+    splice @{$config{config}{history}}, $start, $end_index, { created => get_time(), comment => $options{comment} };
 
     $tar->replace_content($config{manifest}{Config}, encode_json(\%{$config{config}}));
     $tar->replace_content('manifest.json', encode_json([ \%{$config{manifest}} ]));
@@ -270,7 +287,7 @@ sub get_save_details {
             config   => (decode_json $tar->get_content($manifest->{Config}))
         );
 
-        $images{"-ZZZ-Image-$details{count}"} = \%detail;
+        $images{"-image-$details{count}"} = \%detail;
 
         for (@{$manifest->{RepoTags}}) {
             $images{$_} = \%detail;
