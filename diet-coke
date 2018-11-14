@@ -1,0 +1,332 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use List::Util qw(any first);
+use Getopt::Std qw(getopts);
+use Data::Dump qw(dd);
+use POSIX qw(strftime mktime);
+use Digest::SHA qw(sha256_hex);
+use JSON::XS;
+use Archive::Tar;
+
+sub usage {
+    my @tricks = (
+        "DevOps hate him!! Lose 5 layers with this simple trick!!!",
+        "one weird trick DevOps engineers don't want you to know!"
+    );
+
+    my ($seconds) = localtime;
+    my $trick = $tricks[$seconds % scalar(@tricks)];
+
+    print <<USAGE
+diet-coke - $trick
+
+    diet-coke [-i <file>] [-s] [-o <file>] [-g <image>] <layer>-[<layer>]
+    diet-coke [-i <file>] -l
+
+Options:
+    -i  Input file, when - is given STDIN is used, default: -
+    -o  Output file, when - is given STDOUT is used, default: -
+    -g  On which image diet coke should work
+    -s  Suffer, even in STDOUT is a tty, write to STDOUT
+    -l  List layers in given save file
+    -h  Show this help
+USAGE
+
+}
+
+sub eprint {
+    print STDERR join(' ', @_);
+}
+
+sub MAIN {
+    if (scalar(@ARGV) == 0 or any {/-h/} @ARGV) {
+        usage;
+        exit;
+    }
+
+    my %options = (
+        input  => '-',
+        output => '-',
+        tty    => (-t 1),
+        suffer => 0,
+        image  => 0,
+    );
+
+    my %opts = ();
+    getopts('i:so:lg:', \%opts);
+
+    if ($opts{s}) {
+        $options{suffer} = 1;
+    }
+
+    if (defined($opts{i}) and $opts{i} ne '-') {
+        $options{input} = $opts{i};
+    }
+
+    if (defined($opts{o}) and $opts{o} ne '-') {
+        $options{output} = $opts{o};
+        $options{tty} = 0;
+    }
+
+    my $tar = Archive::Tar->new;
+    my $ret = 0;
+
+    if ($options{input} eq '-') {
+        $ret = $tar->read(\*STDIN);
+    }
+    else {
+        $ret = $tar->read($options{input});
+    }
+
+    if ($ret < 1 or !check_save($tar)) {
+        eprint "Empty or corrupted save loaded\n";
+        exit(1);
+    }
+
+    my %details = get_save_details($tar);
+
+    if ($opts{g} and not defined($details{images}{$opts{g}})) {
+        eprint "No image found with the name $opts{g}, only found: " . join(', ', keys(%{$details{images}})) . "\n";
+        exit(1);
+    }
+    elsif (!$opts{g}) {
+        if ($details{count} > 1) {
+            eprint "No image selected while save contains multiple images: " . join(', ', keys(%{$details{images}})) . "\n";
+            exit(1);
+        }
+
+        my @keys = keys(%{$details{images}});
+        $options{image} = $keys[0];
+    }
+    else {
+        $options{image} = $opts{g};
+    }
+
+    eprint "INFO: Selected image: $options{image}\n";
+
+    my %config = %{$details{images}{$options{image}}};
+
+    if ($opts{l}) {
+        list_layers(%config);
+        exit(1);
+    }
+
+    if ($options{tty} and not $options{suffer}) {
+        eprint "ERROR: refusing to print tar to tty. if you really want this, give the -s flag\n";
+        exit(1);
+    }
+
+    if (scalar(@ARGV) < 1) {
+        eprint "ERROR: missing layer range\n";
+        exit(1);
+    }
+
+    my @layers = get_layers(%config);
+    my $range = shift @ARGV;
+
+    my ($start, $end) = (split('-', $range, 2), undef);
+
+    if (!$end) {
+        $end = $start;
+        for (@layers) {
+            $end = $_->{layer} if ($_->{layer} and $_->{layer} > $end)
+        }
+    }
+
+    my $end_index = first { defined $layers[$_]->{layer} and $layers[$_]->{layer} == $end } (0..scalar(@layers));
+
+    if ($start < 0) {
+        eprint "ERROR: start layer index is negative\n";
+        exit(1);
+    }
+
+    if ($start == $end) {
+        eprint "ERROR: start and end layer are on the same index\n";
+        exit(1);
+    }
+
+    my $start_layer = load_layer($tar, $start, %config);
+
+    eprint "INFO: Compressing layers $start to and including $end\n";
+
+    for ($start + 1 .. $end) {
+        my $merge_layer = load_layer($tar, $_, %config);
+        apply_layer($start_layer, $merge_layer);
+    }
+
+    my $new_layer = $start_layer->write();
+    $tar->replace_content(@{$config{manifest}{Layers}}[$end], $new_layer);
+    my $new_layer_id = sha256_hex($new_layer);
+
+    for ($start .. ($end - 1)) {
+        my $layer = @{$config{manifest}{Layers}}[$_];
+        $layer =~ s/layer\.tar$//;
+        $tar->remove(
+            $layer . "layer.tar",
+            $layer . "VERSION",
+            $layer . "json",
+            $layer
+        );
+    }
+
+    splice @{$config{manifest}{Layers}}, $start, ($end - $start), ();
+    splice @{$config{config}{rootfs}{diff_ids}}, $start, $end_index, ("sha256:$new_layer_id");
+    splice @{$config{config}{history}}, $start, $end_index, { created => get_time(), comment => "diet coke: $options{image}" };
+
+    $tar->replace_content($config{manifest}{Config}, encode_json(\%{$config{config}}));
+    $tar->replace_content('manifest.json', encode_json([ \%{$config{manifest}} ]));
+
+    if ($options{output} eq '-') {
+        $ret = $tar->write(\*STDOUT);
+    }
+    else {
+        $ret = $tar->write($options{output});
+    }
+
+    eprint "INFO: Done\n";
+}
+
+sub apply_layer {
+    my ($target, $from) = @_;
+
+    my %target_files = map {$_, 1} $target->list_files();
+
+    for my $file ($from->list_files()) {
+        if ($file =~ /(.+\/)\.wh\.\.wh\.\.opq$/) {
+            eprint "INFO: clean: $1\n";
+            my $dir = $1;
+            my $dirL = length $1;
+            $target->remove(reverse grep {length > $dirL and substr($_, 0, $dirL) eq $dir} $target->list_files());
+            $target->add_files($from->get_files($file));
+            next;
+        }
+
+        if ($target_files{$file}) {
+            if ($file =~ /\/$/) {
+                next;
+            }
+
+            $target->remove($file);
+            $target->add_files($from->get_files($file));
+            eprint "INFO: overwrite: $file\n";
+        }
+        else {
+            if ($file =~ /(.+)\/.wh.([^\/]+)/) {
+                $file = "$1/$2";
+                eprint "INFO: remove: $file\n";
+                $target->remove($file);
+                next;
+            }
+
+            $target->add_files($from->get_files($file));
+            eprint "INFO: new: $file\n";
+        }
+    }
+}
+
+sub load_layer {
+    my ($tar, $index, %config) = @_;
+
+    my $layer = Archive::Tar->new;
+    my $layer_bytes = "";
+    open(my $layer_tar, '+>', \$layer_bytes) or die 'no perlio support :(';
+    print $layer_tar $tar->get_content(@{$config{manifest}{Layers}}[$index]);
+    seek $layer_tar, 0, 0;
+    $layer->read($layer_tar);
+
+    return $layer;
+}
+
+sub get_time {
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime();
+    return strftime("%FT%T.00000000Z", $sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst);
+}
+
+sub check_save {
+    my ($tar) = @_;
+
+    if (!$tar->contains_file('manifest.json')) {
+        return 0;
+    }
+
+    # Could use some more checks but, blegh.
+
+    return 1;
+}
+
+sub get_save_details {
+    my ($tar) = @_;
+    my %images = ();
+    my %details = (
+        images => \%images,
+        count  => 0
+    );
+    my $manifests = decode_json $tar->get_content('manifest.json');
+
+    for my $manifest (@{$manifests}) {
+        my %detail = (
+            manifest => ($manifest),
+            config   => (decode_json $tar->get_content($manifest->{Config}))
+        );
+
+        $images{"-ZZZ-Image-$details{count}"} = \%detail;
+
+        for (@{$manifest->{RepoTags}}) {
+            $images{$_} = \%detail;
+        }
+
+        $details{count}++;
+    }
+
+    return %details;
+}
+
+sub get_layers {
+    my (%config) = @_;
+
+    my $layer = 0;
+    my @layers = ();
+
+    for (@{$config{config}{history}}) {
+        my $expl = "EXT [No explaination found]";
+        if ($_->{created_by}) {
+            $expl = $_->{created_by};
+
+            $expl =~ s/\/bin\/sh -c\s+/RUN /;
+
+            if ($expl =~ /#\(nop\)\s+(.+)/) {
+                $expl = $1;
+            }
+        }
+        elsif ($_->{comment}) {
+            $expl = 'EXT Comment: ' . $_->{comment};
+        }
+
+        my $layer_id = undef;
+        my $index = undef;
+
+        if (!$_->{empty_layer}) {
+            $index = $layer;
+            $layer_id = @{$config{config}{rootfs}{diff_ids}}[$layer++]
+        }
+
+        push @layers, {
+            layer => $index,
+            id    => $layer_id,
+            expl  => $expl
+        };
+    }
+
+    return @layers;
+}
+
+sub list_layers {
+    my (%config) = @_;
+
+    for (get_layers(%config)) {
+        eprint '' . (defined $_->{layer} ? sprintf('%2d', $_->{layer}) : '  ') . ' ' . (defined $_->{id} ? $_->{id} : ' ' x 71) . ' ' . $_->{expl} . "\n";
+    }
+}
+
+MAIN;
